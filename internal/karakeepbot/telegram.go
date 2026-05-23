@@ -32,61 +32,22 @@ func createTelegram(logger *logging.Logger, config *config.TelegramConfig) *Tele
 	return &Telegram{Bot: telegramBot, token: config.Token}
 }
 
-// SendNewMessage sends a new message to the user's chat.
-func (t Telegram) SendNewMessage(ctx context.Context, msg *TelegramMessage) error {
-	params := &tgbotapi.SendMessageParams{
-		ChatID:          msg.Chat.ID,
-		MessageThreadID: msg.MessageThreadID,
-		Text:            msg.Text,
-	}
-
-	if _, err := t.SendMessage(ctx, params); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// SendPhotoWithCaption sends a photo with a caption.
-func (t *Telegram) SendPhotoWithCaption(ctx context.Context, msg *TelegramMessage, photoID string, caption string) error {
-	params := &tgbotapi.SendPhotoParams{
-		ChatID:          msg.Chat.ID,
-		MessageThreadID: msg.MessageThreadID,
-		Photo:           &models.InputFileString{Data: photoID},
-		Caption:         caption,
-	}
-
-	if _, err := t.SendPhoto(ctx, params); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// SendReply sends a reply to a specific message.
-func (t Telegram) SendReply(ctx context.Context, msg *TelegramMessage, text string) error {
-	params := &tgbotapi.SendMessageParams{
-		ChatID:          msg.Chat.ID,
-		MessageThreadID: msg.MessageThreadID,
-		ReplyParameters: &models.ReplyParameters{MessageID: msg.ID},
-		Text:            text,
-	}
-
-	if _, err := t.SendMessage(ctx, params); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// DeleteOriginalMessage deletes the original message from the user's chat.
-func (t Telegram) DeleteOriginalMessage(ctx context.Context, msg *TelegramMessage) error {
-	params := &tgbotapi.DeleteMessageParams{
+// SetReaction sets an emoji reaction on a message.
+func (t Telegram) SetReaction(ctx context.Context, msg *TelegramMessage, emoji string) error {
+	params := &tgbotapi.SetMessageReactionParams{
 		ChatID:    msg.Chat.ID,
 		MessageID: msg.ID,
+		Reaction: []models.ReactionType{
+			{
+				Type: models.ReactionTypeTypeEmoji,
+				ReactionTypeEmoji: &models.ReactionTypeEmoji{
+					Emoji: emoji,
+				},
+			},
+		},
 	}
 
-	if _, err := t.DeleteMessage(ctx, params); err != nil {
+	if _, err := t.Bot.SetMessageReaction(ctx, params); err != nil {
 		return err
 	}
 
