@@ -12,14 +12,19 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
-	"time"
+	"unicode/utf16"
 
-	"github.com/Madh93/go-karakeep"
 	"github.com/Madh93/karakeepbot/internal/config"
 	"github.com/Madh93/karakeepbot/internal/fileprocessor"
 	"github.com/Madh93/karakeepbot/internal/filevalidator"
 	"github.com/Madh93/karakeepbot/internal/logging"
 	"github.com/Madh93/karakeepbot/internal/validation"
+	"github.com/go-telegram/bot/models"
+)
+
+const (
+	successReaction = "👍"
+	failureReaction = "👎"
 )
 
 // KarakeepBot represents the bot with its dependencies, including the Karakeep
@@ -32,7 +37,6 @@ type KarakeepBot struct {
 	fileValidators map[string]fileprocessor.Validator
 	allowlist      []int64
 	threads        []int
-	waitInterval   int
 }
 
 // New creates a new KarakeepBot instance, initializing the Karakeep and Telegram
@@ -64,7 +68,6 @@ func New(logger *logging.Logger, config *config.Config) *KarakeepBot {
 		telegram:       createTelegram(logger, &config.Telegram),
 		allowlist:      config.Telegram.Allowlist,
 		threads:        config.Telegram.Threads,
-		waitInterval:   config.Karakeep.Interval,
 		fileProcessor:  fileProcessor,
 		fileValidators: fileValidators,
 		logger:         logger,
@@ -108,75 +111,34 @@ func (kb KarakeepBot) handler(ctx context.Context, _ *Bot, update *TelegramUpdat
 
 	kb.logger.Debug("Received message from allowed chat ID and allowed thread ID", msg.Attrs()...)
 
-	// Parse the message to get corresponding bookmark type
-	kb.logger.Debug("Parsing message to get corresponding bookmark type", msg.Attrs()...)
-	b, err := kb.parseMessage(ctx, msg)
+	// Parse the message to get corresponding bookmark types
+	kb.logger.Debug("Parsing message to get corresponding bookmark types", msg.Attrs()...)
+	bookmarks, err := kb.parseMessage(ctx, msg)
 	if err != nil {
 		kb.logger.Error("Failed to parse message", msg.AttrsWithError(err)...)
+		kb.react(ctx, &msg, failureReaction)
 		return
 	}
 
-	// Create the bookmark
-	kb.logger.Debug(fmt.Sprintf("Creating bookmark of type %s", b))
-	bookmark, err := kb.karakeep.CreateBookmark(ctx, b)
-	if err != nil {
-		kb.logger.Error("Failed to create bookmark", "error", err)
-		return
-	}
-	kb.logger.Info("Created bookmark", bookmark.Attrs()...)
-
-	// Wait until bookmark tags are updated
-	kb.logger.Debug("Waiting for bookmark tags to be updated", bookmark.Attrs()...)
-	for {
-		bookmark, err = kb.karakeep.RetrieveBookmarkById(ctx, bookmark.Id)
+	for _, b := range bookmarks {
+		kb.logger.Debug(fmt.Sprintf("Creating bookmark of type %s", b))
+		bookmark, err := kb.karakeep.CreateBookmark(ctx, b)
 		if err != nil {
-			kb.logger.Error("Failed to retrieve bookmark", "error", err)
+			kb.logger.Error("Failed to create bookmark", "error", err)
+			kb.react(ctx, &msg, failureReaction)
 			return
 		}
-		if *bookmark.TaggingStatus == karakeep.BookmarkTaggingStatusSuccess {
-			break
-		} else if *bookmark.TaggingStatus == karakeep.BookmarkTaggingStatusFailure {
-			kb.logger.Error("Failed to update bookmark tags", bookmark.AttrsWithError(err)...)
-			return
-		}
-		kb.logger.Debug(fmt.Sprintf("Bookmark is still pending, waiting %d seconds before retrying", kb.waitInterval), bookmark.Attrs()...)
-		time.Sleep(time.Duration(kb.waitInterval) * time.Second)
+		kb.logger.Info("Created bookmark", bookmark.Attrs()...)
 	}
 
-	// Get hashtags
-	hashtags := bookmark.Hashtags()
+	kb.react(ctx, &msg, successReaction)
+	kb.logger.Info("Processed message", msg.Attrs()...)
+}
 
-	// Send back with hashtags
-	if msg.Photo != nil {
-		// Add hashtags
-		caption := msg.Caption + "\n\n" + hashtags
-
-		// Send back the original photo with hashtags as caption
-		kb.logger.Debug("Sending updated message with photo and hashtags", msg.Attrs()...)
-		if err := kb.telegram.SendPhotoWithCaption(ctx, &msg, msg.Photo[len(msg.Photo)-1].FileID, caption); err != nil {
-			kb.logger.Error("Failed to send photo with caption", msg.AttrsWithError(err)...)
-			return
-		}
-	} else {
-		// Add hashtags
-		msg.Text = msg.Text + "\n\n" + hashtags
-
-		// Send back new message with hashtags
-		kb.logger.Debug("Sending updated message with hashtags", msg.Attrs()...)
-		if err := kb.telegram.SendNewMessage(ctx, &msg); err != nil {
-			kb.logger.Error("Failed to send new message", msg.AttrsWithError(err)...)
-			return
-		}
+func (kb KarakeepBot) react(ctx context.Context, msg *TelegramMessage, emoji string) {
+	if err := kb.telegram.SetReaction(ctx, msg, emoji); err != nil {
+		kb.logger.Error("Failed to set reaction", msg.AttrsWithError(err)...)
 	}
-
-	// Delete original message
-	kb.logger.Debug("Deleting original message", msg.Attrs()...)
-	if err := kb.telegram.DeleteOriginalMessage(ctx, &msg); err != nil {
-		kb.logger.Error("Failed to delete original message", msg.AttrsWithError(err)...)
-		return
-	}
-
-	kb.logger.Info("Updated message", msg.Attrs()...)
 }
 
 // isChatIdAllowed checks if the chat ID is allowed to receive messages.
@@ -200,18 +162,103 @@ func (kb KarakeepBot) isThreadIdAllowed(threadId int) bool {
 	return len(kb.threads) == 0 || slices.Contains(kb.threads, threadId)
 }
 
-// parseMessage parses the incoming Telegram message and returns the corresponding Bookmark type.
-func (kb KarakeepBot) parseMessage(ctx context.Context, msg TelegramMessage) (BookmarkType, error) {
-	switch {
-	case msg.Photo != nil:
-		return kb.handlePhotoMessage(ctx, msg)
-	case validation.ValidateURL(msg.Text) == nil:
-		return NewLinkBookmark(msg.Text), nil
-	case msg.Text != "":
-		return NewTextBookmark(msg.Text), nil
-	default:
-		return nil, errors.New("unsupported bookmark type")
+// parseMessage parses the incoming Telegram message and returns corresponding Bookmark types.
+func (kb KarakeepBot) parseMessage(ctx context.Context, msg TelegramMessage) ([]BookmarkType, error) {
+	text := msg.Text
+	entities := msg.Entities
+	if strings.TrimSpace(text) == "" {
+		text = msg.Caption
+		entities = msg.CaptionEntities
 	}
+
+	if strings.TrimSpace(text) != "" {
+		return parseTextBookmarks(text, entities), nil
+	}
+
+	if msg.Photo != nil {
+		bookmark, err := kb.handlePhotoMessage(ctx, msg)
+		if err != nil {
+			return nil, err
+		}
+		return []BookmarkType{bookmark}, nil
+	}
+
+	return nil, errors.New("unsupported bookmark type")
+}
+
+func parseTextBookmarks(text string, entities []models.MessageEntity) []BookmarkType {
+	links := extractLinks(text, entities)
+	trimmedText := strings.TrimSpace(text)
+	if validation.ValidateURL(trimmedText) == nil {
+		return []BookmarkType{NewLinkBookmark(trimmedText)}
+	}
+
+	bookmarks := []BookmarkType{NewTextBookmark(text)}
+	for _, link := range links {
+		bookmarks = append(bookmarks, NewLinkBookmark(link))
+	}
+	return bookmarks
+}
+
+func extractLinks(text string, entities []models.MessageEntity) []string {
+	seen := map[string]struct{}{}
+	links := make([]string, 0, len(entities))
+
+	for _, entity := range entities {
+		var link string
+		switch entity.Type {
+		case models.MessageEntityTypeURL:
+			link = substringByUTF16Offset(text, entity.Offset, entity.Length)
+		case models.MessageEntityTypeTextLink:
+			link = entity.URL
+		default:
+			continue
+		}
+
+		link = strings.TrimSpace(link)
+		if validation.ValidateURL(link) != nil {
+			continue
+		}
+		if _, ok := seen[link]; ok {
+			continue
+		}
+		seen[link] = struct{}{}
+		links = append(links, link)
+	}
+
+	return links
+}
+
+func substringByUTF16Offset(text string, offset int, length int) string {
+	if offset < 0 || length < 0 {
+		return ""
+	}
+
+	start := -1
+	end := -1
+	pos := 0
+	runes := []rune(text)
+	for i, r := range runes {
+		if pos == offset {
+			start = i
+		}
+		pos += utf16.RuneLen(r)
+		if pos == offset+length {
+			end = i + 1
+			break
+		}
+	}
+	if pos == offset && start == -1 {
+		start = len(runes)
+	}
+	if pos == offset+length && end == -1 {
+		end = len(runes)
+	}
+	if start == -1 || end == -1 || start > end {
+		return ""
+	}
+
+	return string(runes[start:end])
 }
 
 // handlePhotoMessage processes a message containing a photo.
@@ -224,9 +271,6 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	fileURL, err := kb.telegram.GetFileURL(ctx, photo.FileID)
 	if err != nil {
 		kb.logger.Error("Failed to get file URL", msg.AttrsWithError(err)...)
-		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to process image from Telegram servers, try again later"); replyErr != nil {
-			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
-		}
 		return nil, errors.New("couldn't get file URL")
 	}
 
@@ -234,9 +278,6 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	filePath, mimeType, err := kb.fileProcessor.Process(fileURL, nil)
 	if err != nil {
 		kb.logger.Error("Failed to process image", msg.AttrsWithError(err)...)
-		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to process image"); replyErr != nil {
-			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
-		}
 		return nil, errors.New("couldn't process image")
 	}
 	defer func() {
@@ -254,9 +295,6 @@ func (kb *KarakeepBot) handlePhotoMessage(ctx context.Context, msg TelegramMessa
 	asset, err := kb.karakeep.CreateAsset(ctx, filePath, mimeType)
 	if err != nil {
 		kb.logger.Error("Failed to upload asset", msg.AttrsWithError(err)...)
-		if replyErr := kb.telegram.SendReply(ctx, &msg, "⚠️ Failed to upload asset to Karakeep"); replyErr != nil {
-			kb.logger.Error("Failed to send reply to user", "reply_error", replyErr)
-		}
 		return nil, errors.New("couldn't upload asset")
 	}
 
